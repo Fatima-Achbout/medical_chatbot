@@ -1,0 +1,23 @@
+# Datasets
+HealthCareMagic-100k.json
+cleaned/HealthCareMagic-100k.jsonl
+final_model/adapter_model.safetensors
+*.csv
+*.tsv
+*.json
+
+# If you want to keep small data files, you can unignore them:
+
+# Model Checkpoints and Weights
+checkpoints/
+
+
+# Python & Jupyter
+__pycache__/
+.ipynb_checkpoints/
+*.py[cod]
+*$py.class
+.env
+.venv/
+env/
+venv/

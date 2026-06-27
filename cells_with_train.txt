@@ -1,0 +1,200 @@
+Cell 2:
+# ── CELL 3 : Monte Google Drive ──────────────────────────────────
+# Mets tes fichiers JSONL dans :  Mon Drive/medical_finetune/
+from google.colab import drive
+drive.mount("/content/drive")
+
+import os
+DRIVE_DIR = "/content/drive/MyDrive/medical_finetune"
+os.makedirs(DRIVE_DIR, exist_ok=True)
+
+TRAIN_FILE = f"{DRIVE_DIR}/medical_60mb_train.jsonl"
+VAL_FILE   = f"{DRIVE_DIR}/medical_finetune_val.jsonl"
+
+for f in [TRAIN_FILE, VAL_FILE]:
+    exists = os.path.exists(f)
+    size   = os.path.getsize(f)/1024/1024 if exists else 0
+    status = f"✅  {size:.1f} MB" if exists else "❌  FICHIER MANQUANT"
+    print(f"{os.path.basename(f):<40} {status}")
+---
+Cell 4:
+# ── CELL 5 : Charge le dataset ───────────────────────────────────
+from datasets import load_dataset
+
+dataset = load_dataset("json", data_files={
+    "train":      TRAIN_FILE,
+    "validation": VAL_FILE
+})
+
+print(f"Train      : {len(dataset['train']):,} exemples")
+print(f"Validation : {len(dataset['validation']):,} exemples")
+print("Exemple :")
+print(dataset["train"][0]["text"][:400], "...")
+---
+Cell 5:
+# ── CELL 6 : Charge le modèle en 4-bit (optimisé T4) ─────────────
+from unsloth import FastLanguageModel
+
+BASE_MODEL   = "mistralai/Mistral-7B-Instruct-v0.3"
+MAX_SEQ_LEN  = 1024   # max tokens par exemple
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name        = BASE_MODEL,
+    max_seq_length    = MAX_SEQ_LEN,
+    dtype             = None,     # auto-detect (bfloat16 si dispo, sinon float16)
+    load_in_4bit      = True,     # OBLIGATOIRE sur T4 pour tenir en VRAM
+)
+
+tokenizer.pad_token = tokenizer.eos_token
+print("✅ Modèle chargé en 4-bit")
+---
+Cell 6:
+# ── CELL 7 : LoRA ────────────────────────────────────────────────
+from peft import LoraConfig
+
+model = FastLanguageModel.get_peft_model(
+    model,
+    r              = 16,
+    lora_alpha     = 32,
+    lora_dropout   = 0.05,
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                       "gate_proj", "up_proj", "down_proj"],
+    bias           = "none",
+    use_gradient_checkpointing = True,   # économise ~30% VRAM
+    random_state   = 42,
+)
+
+total_params  = sum(p.numel() for p in model.parameters())
+train_params  = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Paramètres entraînables : {train_params/1e6:.1f}M / {total_params/1e6:.0f}M ({train_params/total_params*100:.1f}%)")
+---
+Cell 7:
+# ── CELL 8 : Config entraînement ─────────────────────────────────
+import os
+from trl import SFTTrainer, SFTConfig
+
+CKPT_DIR = f"{DRIVE_DIR}/checkpoints"   # sauvegarde sur Drive
+os.makedirs(CKPT_DIR, exist_ok=True)
+
+sft_config = SFTConfig(
+    output_dir                 = CKPT_DIR,
+    dataset_text_field         = "text",
+    max_seq_length             = MAX_SEQ_LEN,
+    packing                    = True, # Enable packing to resolve the ValueError
+
+    # ── 1 seul batch par step (safe pour T4) ──
+    per_device_train_batch_size  = 1,
+    gradient_accumulation_steps  = 16,   # batch effectif = 16
+
+    # ── 1 seule epoch ─────────────────────────
+    num_train_epochs             = 1,
+
+    learning_rate              = 2e-4,
+    lr_scheduler_type          = "cosine",
+    warmup_ratio               = 0.05,
+    fp16                       = not torch.cuda.is_bf16_supported(),
+    bf16                       = torch.cuda.is_bf16_supported(),
+
+    # ── Checkpoints toutes les 200 steps ──────
+    eval_strategy              = "steps",
+    eval_steps                 = 50,
+    save_strategy              = "steps",
+    save_steps                 = 50,
+    save_total_limit           = 3,      # garde les 3 derniers
+    load_best_model_at_end     = True,
+
+    logging_steps              = 50,
+    report_to                  = "none",
+)
+
+print("✅ Config prête")
+
+# Estimation durée
+n_steps = len(dataset["train"]) // (sft_config.per_device_train_batch_size * sft_config.gradient_accumulation_steps)
+print(f"Steps estimés : {n_steps:,}")
+print(f"Checkpoints   : tous les {sft_config.save_steps} steps")
+print(f"Durée estimée : {n_steps * 1.8 / 3600:.1f}h sur T4")
+---
+Cell 8:
+# ── CELL 9 : Entraînement ────────────────────────────────────────
+trainer = SFTTrainer(
+    model          = model,
+    train_dataset  = dataset["train"],
+    eval_dataset   = dataset["validation"],
+    tokenizer      = tokenizer,
+    args           = sft_config,
+)
+
+print("🚀 Démarrage...")
+result = trainer.train()
+
+print(f"\n✅ Terminé !")
+print(f"   Loss finale     : {result.training_loss:.4f}")
+print(f"   Steps effectués : {result.global_step}")
+---
+Cell 9:
+# ── CELL 10 : Sauvegarde finale sur Drive ────────────────────────
+FINAL_DIR = f"{DRIVE_DIR}/final_model"
+trainer.save_model(FINAL_DIR)
+tokenizer.save_pretrained(FINAL_DIR)
+
+import os
+size_mb = sum(
+    os.path.getsize(os.path.join(FINAL_DIR, f))
+    for f in os.listdir(FINAL_DIR)
+) / 1024**2
+
+print(f"✅ Modèle sauvegardé dans : {FINAL_DIR}")
+print(f"   Taille : {size_mb:.0f} MB")
+print(f"   Fichiers : {os.listdir(FINAL_DIR)}")
+---
+Cell 10:
+# ── CELL 11 : Test du chatbot ────────────────────────────────────
+from peft import PeftModel
+
+# Recharge depuis Drive (utile si session redémarrée)
+base, tok = FastLanguageModel.from_pretrained(
+    model_name   = BASE_MODEL,
+    max_seq_length = MAX_SEQ_LEN,
+    load_in_4bit = True,
+)
+finetuned = PeftModel.from_pretrained(base, FINAL_DIR)
+finetuned.eval()
+
+SYSTEM = (
+     "You are a careful medical assistant for educational support. "
+    "Explain likely possibilities without claiming certainty, use calm natural language, "
+    "and focus on practical next steps, common evaluations, and relevant self-care. "
+    "When medications are mentioned, keep suggestions conservative and safety-aware, "
+    "taking allergies, pregnancy, age, other medicines, and medical history into account. "
+    "Do not blindly prescribe dangerous drugs, do not replace a physician, and recommend "
+    "urgent care only when red-flag symptoms make it medically appropriate."
+)
+
+def ask(question):
+    prompt = f"<s>[INST] <<SYS>>\n{SYSTEM}\n<</SYS>>\n\n{question} [/INST]"
+    inputs = tok(prompt, return_tensors="pt").to("cuda")
+    with torch.no_grad():
+        out = finetuned.generate(
+            **inputs,
+            max_new_tokens     = 400,
+            temperature        = 0.3,
+            top_p              = 0.9,
+            repetition_penalty = 1.1,
+            do_sample          = True,
+            eos_token_id       = tok.eos_token_id,
+            pad_token_id       = tok.eos_token_id,
+        )
+    full = tok.decode(out[0], skip_special_tokens=True)
+    return full.split("[/INST]")[-1].strip()
+
+print("=" * 60)
+print("Q: I have a headache and fever for 3 days. What should I do?")
+print("-" * 60)
+print(ask("I have a headache and fever for 3 days. What should I do?"))
+print()
+print("=" * 60)
+print("Q: What are the side effects of ibuprofen?")
+print("-" * 60)
+print(ask("What are the side effects of ibuprofen?"))
+---
